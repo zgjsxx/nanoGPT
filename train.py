@@ -45,6 +45,7 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
+data_dir = ''
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -72,9 +73,47 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+small_gpu = False # apply a conservative preset for <=8GB GPUs like GTX 1060
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
+
+default_gpt2_shape = {
+    'gradient_accumulation_steps': 5 * 8,
+    'batch_size': 12,
+    'block_size': 1024,
+    'n_layer': 12,
+    'n_head': 12,
+    'n_embd': 768,
+}
+
+def apply_small_gpu_preset(reason):
+    global gradient_accumulation_steps, batch_size, block_size
+    global n_layer, n_head, n_embd, eval_interval, eval_iters
+    global log_interval, compile, learning_rate
+    print(f"applying small GPU preset ({reason})")
+    gradient_accumulation_steps = 16
+    batch_size = 4
+    block_size = 128
+    n_layer = 4
+    n_head = 4
+    n_embd = 128
+    eval_interval = min(eval_interval, 250)
+    eval_iters = min(eval_iters, 20)
+    log_interval = min(log_interval, 10)
+    learning_rate = min(learning_rate, 3e-4)
+    compile = False
+
+using_default_gpt2_shape = all(globals()[k] == v for k, v in default_gpt2_shape.items())
+if device.startswith('cuda') and torch.cuda.is_available():
+    total_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    if small_gpu and using_default_gpt2_shape:
+        apply_small_gpu_preset(f"--small_gpu=True on {total_memory_gb:.1f}GB GPU")
+    elif total_memory_gb <= 8 and using_default_gpt2_shape:
+        apply_small_gpu_preset(f"detected {total_memory_gb:.1f}GB GPU with GPT-2-sized defaults")
+    elif small_gpu:
+        print("small_gpu=True requested, keeping explicit model/batch settings from config")
+
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
@@ -112,7 +151,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-data_dir = os.path.join('data', dataset)
+data_dir = data_dir or os.path.join('data', dataset)
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -120,6 +159,11 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    if len(data) <= block_size:
+        raise ValueError(
+            f"{split}.bin only has {len(data)} tokens, which is too small for block_size={block_size}. "
+            "Reduce --block_size or prepare a larger dataset fraction."
+        )
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
